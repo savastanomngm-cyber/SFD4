@@ -300,8 +300,10 @@ let surfView='3d', surfVolCache=null, surfAnaCache=null;
 let _priceLines=[], _lastWallHash='', _crosshairBound=false, _wallPrim=null;
 let _surfHash='', _gexHash='', _lastHistLoad=0;
 const $=id=>document.getElementById(id);
+/* 🟢 GITHUB-PAGES API BASE: '' on localhost, set SFD_API in console for Pages */
+const API=(localStorage.getItem('SFD_API')||'').replace(/\/+$/,'');
 const fmtN=n=>(+n).toLocaleString(undefined,{maximumFractionDigits:0});
-async function j(u){const r=await fetch(u);if(!r.ok)throw new Error(u+' -> HTTP '+r.status);
+async function j(u){const r=await fetch(API+u);if(!r.ok)throw new Error(u+' -> HTTP '+r.status);
 const t=await r.text();try{return JSON.parse(t)}catch(e){throw new Error(u+' -> not JSON')}}
 function showError(m){$('error').style.display='block';$('error').textContent='❌ '+m}
 function clearError(){$('error').style.display='none'}
@@ -330,7 +332,7 @@ $('intSel').onchange=e=>{currentInt=e.target.value;rebuildRanges();loadAll();};
 $('rangeSel').onchange=e=>{currentRange=e.target.value;loadAll();};
 $('srcSel').onchange=()=>loadAll();
 }
-/* ── tabs ─ */
+/* ── tabs ── */
 function switchTab(name){
 document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
 document.querySelectorAll('.tab-content').forEach(c=>c.classList.remove('active'));
@@ -354,7 +356,7 @@ clearError();
 const q=`symbol=${currentSymbol}`;
 const R=await Promise.allSettled([
 j('/api/environment'), j('/api/walls?'+q), j('/api/surface?'+q),
-j(`/api/chart?${q}&interval=${currentInt}&period=${currentRange}&source=${$('srcSel').value}`),
+j(API+`/api/chart?${q}&interval=${currentInt}&period=${currentRange}&source=${$('srcSel').value}`),
 j('/api/verdicts?'+q), j('/api/ticket?'+q), j('/api/playbook?'+q),
 j('/api/vol_surface?'+q), j('/api/gex_signals?'+q)]);
 const V=i=>R[i].status==='fulfilled'?R[i].value:null;
@@ -487,38 +489,53 @@ el.innerHTML=`
 <div class="pb-col"><h4 style="color:var(--red)">Don't</h4>${dontHtml}</div>
 </div>`;
 }
-function buildWallBars(walls,surface,shift=0){
-const prof=walls.profile||{};
-const entries=Object.entries(prof).map(([k,v])=>[parseFloat(k)+shift,v]);
-const maxAbs=Math.max(1,...entries.map(e=>Math.abs(e[1])));
-const bars=[];
-entries.sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]));
-for(const [strike,gex] of entries.slice(0,12)){
-const t=2+(Math.abs(gex)/maxAbs)*12;
-bars.push({price:strike,thickness:t,label:null,
-color:gex>=0?'rgba(38,166,154,0.30)':'rgba(239,83,80,0.30)'});
-}
-if(walls.put_wall) bars.push({price:walls.put_wall+shift,thickness:10,color:'rgba(239,83,80,0.60)',label:'PUT WALL '+fmtN(walls.put_wall+shift)});
-if(walls.call_wall) bars.push({price:walls.call_wall+shift,thickness:10,color:'rgba(38,166,154,0.60)',label:'CALL WALL '+fmtN(walls.call_wall+shift)});
-return bars;
+/* 🟢 GEXBOT-STYLE OVERLAY: profile-based bars (glow band + right histogram) */
+function buildGexBars(walls,shift=0){
+  const prof=walls.profile||{};
+  const shiftN=shift||0;
+  const spot=(walls.spot||0)+shiftN;
+  let entries=Object.entries(prof).map(([k,v])=>[parseFloat(k)+shiftN,v]);
+  if(spot) entries=entries.filter(([k])=>Math.abs(k-spot)/spot<=0.06); // ±6% window
+  const maxAbs=Math.max(1,...entries.map(e=>Math.abs(e[1])));
+  const bars=entries.map(([strike,gex])=>({price:strike,m:Math.abs(gex)/maxAbs,pos:gex>=0}))
+                    .filter(b=>b.m>=0.02);                              // noise floor
+  if(walls.put_wall) bars.push({price:walls.put_wall+shiftN,m:1,pos:false,wall:'PUT WALL'});
+  if(walls.call_wall)bars.push({price:walls.call_wall+shiftN,m:1,pos:true,wall:'CALL WALL'});
+  return bars;
 }
 function makeWallPrimitive(series,bars){
-const prim={_bars:bars,_series:null,
-attached(p){this._series=p.series},detached(){},updateAllViews(){},
-paneViews(){return[this._view]}};
-prim._view={zOrder:()=>'bottom',renderer:()=>({
-draw:(target)=>{target.useMediaCoordinateSpace(({context,mediaSize})=>{
-for(const b of prim._bars){
-if(!prim._series)continue;
-const y=prim._series.priceToCoordinate(b.price);
-if(y===null||y===undefined)continue;
-context.fillStyle=b.color;
-context.fillRect(0,y-b.thickness/2,mediaSize.width,b.thickness);
-if(b.label){context.fillStyle='rgba(255,255,255,0.92)';
-context.font='bold 10px -apple-system,monospace';
-context.fillText(b.label,8,y-b.thickness/2-3);}
-}})}})};
-return prim;
+  const prim={_bars:bars,_series:null,
+  attached(p){this._series=p.series},detached(){},updateAllViews(){},
+  paneViews(){return[this._view]}};
+  prim._view={zOrder:()=>'bottom',renderer:()=>({
+  draw:(target)=>{target.useMediaCoordinateSpace(({context,mediaSize})=>{
+    const W=mediaSize.width;
+    const histW=Math.min(W*0.30,340);            // right-side histogram max width
+    for(const b of prim._bars){
+      if(!prim._series)continue;
+      const y=prim._series.priceToCoordinate(b.price);
+      if(y===null||y===undefined)continue;
+      const rgb=b.pos?'38,166,154':'239,83,80';  // green=+γ support, red=−γ resistance
+      // 1) full-width glow band — thickness ∝ |GEX|
+      const bh=Math.max(1,b.m*9);
+      context.fillStyle=`rgba(${rgb},${(0.04+0.16*b.m).toFixed(3)})`;
+      context.fillRect(0,y-bh/2,W,bh);
+      // 2) right-anchored histogram bar — length ∝ |GEX| (the GEXBot profile shape)
+      const bl=Math.max(2,b.m*histW);
+      const hh=Math.max(2,b.m*7);
+      context.fillStyle=`rgba(${rgb},${(0.30+0.50*b.m).toFixed(3)})`;
+      context.fillRect(W-bl,y-hh/2,bl,hh);
+      // 3) strike label on significant levels
+      if(b.m>=0.30||b.wall){
+        const txt=(b.wall?b.wall+' ':'')+fmtN(b.price);
+        const tw=context.measureText(txt).width;
+        context.fillStyle=`rgba(${rgb},0.95)`;
+        context.font='bold 10px -apple-system,monospace';
+        context.fillText(txt,W-bl-tw-6,y+3);
+      }
+    }
+  })}})};
+  return prim;
 }
 /* ══════════ CHART — PERFORMANCE-TUNED + VOL-SURFACE PROJECTION ══════════ */
 function renderChart(candles,walls,surface,verdicts,ticket,source='index'){
@@ -602,7 +619,8 @@ if(candles.length)chart.timeScale().fitContent();
 chartViewKey=viewKey;
 }
 const rth=wm.active==='translated';
-_wallPrim._bars=buildWallBars(walls,surface,(source==='futures'&&rth)?basis:0);
+/* 🟢 GEXBOT OVERLAY: full profile rendered on the price chart */
+_wallPrim._bars=buildGexBars(walls,(source==='futures'&&rth)?basis:0);
 _priceLines.forEach(l=>{try{candleSeries.removePriceLine(l);}catch(e){}});
 _priceLines=[];
 const pfw=walls.put_wall_fut!=null?walls.put_wall_fut:(walls.put_wall!=null?walls.put_wall+basis:null);
@@ -995,7 +1013,7 @@ $('d-'+k+'-body').innerHTML='<span class="dim"><span class="spinner"></span>Wait
 $('dashStatus').innerHTML='<span class="spinner"></span>Running pipeline...';
 $('runDashBtn').disabled=true;
 if(dashEventsSource)dashEventsSource.close();
-dashEventsSource=new EventSource(`/api/run_dashboard_stream?symbol=${currentSymbol}`);
+dashEventsSource=new EventSource(API+`/api/run_dashboard_stream?symbol=${currentSymbol}`);
 dashEventsSource.onmessage=(event)=>{
 const msg=JSON.parse(event.data);
 handleDashStage(msg.stage,msg.data);
@@ -1148,7 +1166,7 @@ $('sentinelTicket').innerHTML='<span class="dim">No ticket yet.</span>';
 setSentinelState('WATCHING');
 const btn=$('sentinelStartBtn');
 btn.textContent='⏹ Stop Sentinel';btn.className='danger';btn.onclick=stopSentinel;
-sentinelSource=new EventSource(`/api/sentinel_stream?symbol=${currentSymbol}`);
+sentinelSource=new EventSource(API+`/api/sentinel_stream?symbol=${currentSymbol}`);
 sentinelSource.onmessage=(e)=>{const msg=JSON.parse(e.data);handleSentinelEvent(msg.event,msg.data);};
 sentinelSource.onerror=()=>{logSentinel('⚠️ Connection interrupted — will retry.','amber');};
 }
@@ -1313,7 +1331,7 @@ while(feed.children.length>40)feed.removeChild(feed.lastChild);
 }
 function connect(){
 if(interpES){try{interpES.close();}catch(e){}}
-interpES=new EventSource('/api/interpreter_stream?symbol='+currentSymbol);
+interpES=new EventSource(API+'/api/interpreter_stream?symbol='+currentSymbol);
 interpES.onopen=()=>{stat.textContent='LIVE';stat.style.color='#3fb950';};
 interpES.onerror=()=>{stat.textContent='RECONNECTING…';stat.style.color='var(--amber)';};
 interpES.onmessage=(e)=>{
@@ -1359,7 +1377,7 @@ function tvLevelList(){
     .forEach(p=>add(p.strike,'Reject '+Math.round(p.strike),'res'));
   ((surfaceData&&surfaceData.pockets)||[]).slice(0,3)
     .forEach(p=>add(p.strike,'Accel '+Math.round(p.strike),'sup'));
-  // ── secondary GEX walls (the faint bands, cap raised to 10) ──
+  // ── secondary GEX walls (the faint bands, cap 10) ──
   const ent=Object.entries(wallsData.profile||{})
     .map(([k,v])=>[parseFloat(k),v]).sort((a,c)=>a[0]-c[0]);
   const maxAbs=Math.max(1,...ent.map(e=>Math.abs(e[1])));
